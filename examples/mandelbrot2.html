@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandelbrot with symjit-wasm</title>
+<!--
+  The Mandelbrot set, computed by a WebAssembly module that symjit-wasm compiles in the
+  browser: the compiler itself is WebAssembly (the crate built for wasm32-unknown-unknown),
+  driven by js/compiler.mjs; the module it writes iterates z = z^2 + c in complex arithmetic
+  and runs through js/symjit.mjs.
+
+  Build the compiler and serve the crate's directory (browsers do not fetch modules from
+  file:// pages):
+
+      cargo build --release --target wasm32-unknown-unknown
+      python3 -m http.server 8000
+      open http://localhost:8000/examples/mandelbrot.html
+
+  `?wasm=URL` loads the compiler from another place.
+-->
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70;
+    --border: #dddbd5; --accent: #2a5bd7; --code: #f0eee9; --error: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa2;
+      --border: #2e2e33; --accent: #7aa2ff; --code: #26262a; --error: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 40px; }
+  h1 { font-size: 22px; margin: 0 0 4px; font-weight: 650; }
+  .lede { color: var(--muted); margin: 0 0 18px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
+    margin-bottom: 12px;
+  }
+  label { color: var(--muted); font-size: 14px; }
+  select, button {
+    font: inherit; font-size: 14px; color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover, select:hover { border-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 13px; margin-left: auto; }
+  .frame {
+    background: #000; border: 1px solid var(--border); border-radius: 8px;
+    overflow: hidden; line-height: 0;
+  }
+  canvas { width: 100%; aspect-ratio: 3 / 2; display: block; cursor: crosshair; touch-action: manipulation; }
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px; margin: 12px 0;
+  }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px;
+  }
+  .stat b { display: block; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  details { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+  pre {
+    background: var(--code); border-radius: 6px; padding: 10px; overflow-x: auto;
+    font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, monospace; margin: 8px 0 4px;
+  }
+  .error { color: var(--error); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mandelbrot set</h1>
+  <p class="lede">Computed by a WebAssembly module that symjit-wasm compiled in this page.
+    The compiler is WebAssembly too.</p>
+
+  <div class="controls">
+    <label>Iterations
+      <select id="iterations">
+        <option>100</option><option selected>250</option><option>500</option>
+        <option>1000</option><option>2500</option>
+      </select>
+    </label>
+    <button id="reset">Reset view</button>
+    <span class="hint">Click to zoom in · shift-click or right-click to zoom out</span>
+  </div>
+
+  <div class="frame"><canvas id="canvas" width="960" height="640"></canvas></div>
+
+  <div class="stats">
+    <div class="stat"><b id="s-compiler">…</b><span>symjit-wasm</span></div>
+    <div class="stat"><b id="s-compile">…</b><span>compile (in browser)</span></div>
+    <div class="stat"><b id="s-size">…</b><span>module size</span></div>
+    <div class="stat"><b id="s-render">…</b><span>render</span></div>
+    <div class="stat"><b id="s-zoom">1×</b><span>zoom</span></div>
+  </div>
+
+  <p id="error" class="error" hidden></p>
+
+  <details>
+    <summary>The model: Symbolica instructions compiled by symjit-wasm</summary>
+    <pre id="model"></pre>
+  </details>
+</main>
+
+<script type="module">
+import { SymjitCompiler, options } from "./compiler.mjs";
+import { SymjitModel } from "./symjit.mjs";
+
+const COMPILER_URL = new URLSearchParams(location.search).get("wasm")
+    ?? "symjit_wasm.wasm";
+
+// escape radius: a large one makes the smooth iteration count smooth
+const RADIUS = 16;
+
+/**
+ * The model, as a Symbolica evaluator's instructions: one complex input c (param 0) and two
+ * outputs, the iteration count n and the last z. The loop is a backward goto, whose
+ * temporaries (z, n) carry values from one iteration to the next, so it needs the direct
+ * translator (`options({direct: true})`).
+ */
+function mandelbrot(maxIterations) {
+    return `([
+  ('assign', ('temp', 0), ('const', 0)),
+  ('assign', ('temp', 1), ('const', 0)),
+  ('label', 0),
+  ('mul', ('temp', 2), [('temp', 0), ('temp', 0)], 0),
+  ('add', ('temp', 0), [('temp', 2), ('param', 0)], 0),
+  ('add', ('temp', 1), [('temp', 1), ('const', 1)], 0),
+  ('fun', ('temp', 3), abs, [], [('temp', 0)], False),
+  ('fun', ('temp', 4), lt, [], [('temp', 3), ('const', 2)], True),
+  ('fun', ('temp', 5), lt, [], [('temp', 1), ('const', 3)], True),
+  ('fun', ('temp', 6), and, [], [('temp', 4), ('temp', 5)], True),
+  ('if_else', ('temp', 6), 1),
+  ('goto', 0),
+  ('label', 1),
+  ('assign', ('out', 0), ('temp', 1)),
+  ('assign', ('out', 1), ('temp', 0))
+], 7, [0, 1, ${RADIUS}, ${maxIterations}])`;
+}
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("canvas");
+const ctx = canvas.getContext("2d");
+const HOME = { cx: -0.6, cy: 0, width: 3.6 };
+let view = { ...HOME };
+let compiler, model, maxIterations;
+let generation = 0;   // a newer render cancels an older one
+
+function showError(message) {
+    $("error").hidden = false;
+    $("error").textContent = message;
+}
+
+async function compileModel() {
+    maxIterations = Number($("iterations").value);
+    const text = mandelbrot(maxIterations);
+    $("model").textContent = text;
+    const t0 = performance.now();
+    const bytes = compiler.translate(text, 1, options({ optLevel: 2, complex: true, direct: true }));
+    const t1 = performance.now();
+    model = await SymjitModel.compile(bytes);
+    $("s-compile").textContent = `${(t1 - t0).toFixed(1)} ms`;
+    $("s-size").textContent = `${(bytes.length / 1024).toFixed(1)} KB`;
+}
+
+// a cosine palette (smooth, cyclic), indexed by the smooth iteration count
+function color(mu, rgb) {
+    const t = Math.sqrt(mu) * 0.18;
+    rgb[0] = 255 * (0.5 + 0.5 * Math.cos(6.2832 * (t + 0.00)));
+    rgb[1] = 255 * (0.5 + 0.5 * Math.cos(6.2832 * (t + 0.15)));
+    rgb[2] = 255 * (0.5 + 0.5 * Math.cos(6.2832 * (t + 0.30)));
+}
+
+async function render() {
+    const mine = ++generation;
+    const w = canvas.width, h = canvas.height;
+    const scale = view.width / w;
+    const image = ctx.createImageData(w, h);
+    const pixels = image.data;
+    const rgb = [0, 0, 0];    
+    const rows = 32;   // rows per slice: the page stays responsive while it renders
+    const args = new Float64Array(2 * w * rows);   // complex inputs: (re, im) per pixel
+    const t0 = performance.now();
+
+    for (let y0 = 0; y0 < h; y0 += rows) {
+        const n = Math.min(rows, h - y0) * w;
+        for (let k = 0; k < n; k++) {
+            const x = k % w, y = y0 + Math.floor(k / w);
+            args[2 * k] = view.cx + (x - w / 2) * scale;
+            args[2 * k + 1] = view.cy - (y - h / 2) * scale;
+        }
+        // per point: n (re, im), then z (re, im)
+        const out = model.evaluateMatrix(args.subarray(0, 2 * n), n);
+        for (let k = 0; k < n; k++) {
+            const p = 4 * (y0 * w + k);
+            const count = out[4 * k];
+            if (count >= maxIterations) {
+                pixels[p] = pixels[p + 1] = pixels[p + 2] = 0;
+            } else {
+                const zr = out[4 * k + 2], zi = out[4 * k + 3];
+                const mu = count + 1 - Math.log2(Math.log(Math.hypot(zr, zi)));
+                color(Math.max(mu, 0), rgb);                
+                pixels[p] = rgb[0]; pixels[p + 1] = rgb[1]; pixels[p + 2] = rgb[2];
+            }
+            pixels[p + 3] = 255;
+        }
+        ctx.putImageData(image, 0, 0, 0, y0, w, rows);
+        await new Promise((resolve) => setTimeout(resolve, 0));   // let the page paint
+        if (mine !== generation) return;
+    }
+    $("s-render").textContent = `${(performance.now() - t0).toFixed(0)} ms`;
+    $("s-zoom").textContent = `${(HOME.width / view.width).toPrecision(3)}×`;
+}
+
+function zoomAt(event, factor) {
+    const r = canvas.getBoundingClientRect();
+    const x = (event.clientX - r.left) * canvas.width / r.width;
+    const y = (event.clientY - r.top) * canvas.height / r.height;
+    const scale = view.width / canvas.width;
+    view = {
+        cx: view.cx + (x - canvas.width / 2) * scale,
+        cy: view.cy - (y - canvas.height / 2) * scale,
+        width: view.width * factor,
+    };
+    render();
+}
+
+canvas.addEventListener("click", (e) => zoomAt(e, e.shiftKey ? 2 : 0.4));
+canvas.addEventListener("contextmenu", (e) => { e.preventDefault(); zoomAt(e, 2); });
+$("reset").addEventListener("click", () => { view = { ...HOME }; render(); });
+$("iterations").addEventListener("change", async () => {
+    try {
+        await compileModel();
+        render();
+    } catch (e) {
+        showError(String(e));
+    }
+});
+
+try {
+    const response = await fetch(COMPILER_URL);
+    if (!response.ok) throw new Error(`${COMPILER_URL}: ${response.status} ${response.statusText}`);
+    compiler = await SymjitCompiler.load(await response.arrayBuffer());
+    $("s-compiler").textContent = compiler.version;
+    await compileModel();
+    await render();
+} catch (e) {
+    showError(`Cannot start: ${e.message ?? e}\n\nBuild the compiler and serve the crate's directory:\n` +
+        "    cargo build --release --target wasm32-unknown-unknown\n" +
+        "    python3 -m http.server 8000\n" +
+        "then open http://localhost:8000/examples/mandelbrot.html");
+}
+</script>
+</body>
+</html>

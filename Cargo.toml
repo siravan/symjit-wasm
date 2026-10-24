@@ -1,0 +1,39 @@
+[package]
+name = "symjit-wasm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Shahriar Iravanian <siravan@svtsim.com>"]
+license = "MIT"
+description = "symjit's compiler with WebAssembly as its only backend; itself compilable to WebAssembly"
+readme = "README.md"
+repository = "https://github.com/siravan/symjit"
+keywords = ["compiler", "webassembly", "computer algebra system"]
+categories = ["compilers", "mathematics", "wasm"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1"
+num-traits = "0.2"
+spec_math = "0.1.6"
+num-complex = "0.4"
+num-rational = "0.4"
+toml = "1.1"
+
+[dev-dependencies]
+num-complex = "0.4"
+# exact numbers between the tests and Node
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+
+# the tests compare the modules with symjit's JIT (native builds only)
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+symjit = "2.28.1"
+
+[features]
+default = ["sympy"]
+# the C interface of the Python package (compiling SymPy models)
+sympy = []
+
+[lib]
+path = "rust/lib.rs"
+crate-type = ["rlib", "cdylib"]

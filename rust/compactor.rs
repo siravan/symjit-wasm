@@ -1,0 +1,253 @@
+use anyhow::Result;
+use std::collections::{HashMap, HashSet};
+
+use super::config::Config;
+use super::mir::{Instruction, Mir};
+use super::serializer::MirWriter;
+use super::symbol::Loc;
+
+// #[derive(Debug)]
+pub struct Compactor {
+    config: Config,
+    code: MirWriter,           // the revised mir
+    live: HashMap<Loc, usize>, // the map of live Stack slots and their last used position
+    stack: HashMap<Loc, Loc>,  // the map of old Stack slots to new Stack slots
+    pool: Vec<Loc>,            // the pool of Stack slots available to reuse
+    labels: HashSet<String>,
+    count_stack: u32, // next stack id to use if the pool is empty
+    depth: isize,     // loop depth
+    fixed: u32,
+}
+
+impl Compactor {
+    pub fn new(config: Config) -> Compactor {
+        let fixed = config.fixed();
+        Compactor {
+            config,
+            code: MirWriter::new(),
+            live: HashMap::new(),
+            stack: HashMap::new(),
+            pool: Vec::new(),
+            labels: HashSet::new(),
+            count_stack: fixed,
+            depth: 0,
+            fixed,
+        }
+    }
+
+    pub fn compact(&mut self, mir: &mut Mir) -> Result<usize> {
+        self.collect_last(mir); // first pass, collect live info
+        self.compact_stack(mir); // second pass, rename stack slots
+        mir.code = std::mem::take(&mut self.code);
+        Ok((self.count_stack) as usize)
+    }
+
+    fn push(&mut self, ins: Instruction) {
+        self.code.push(&ins);
+    }
+
+    fn collect_last(&mut self, mir: &Mir) {
+        for (ip, ins) in mir.code.iter().enumerate() {
+            match ins {
+                Instruction::Load { loc, .. }
+                | Instruction::IfElse { cond: loc, .. }
+                | Instruction::LoadMath { loc, .. }
+                | Instruction::LoadComplex { loc, .. } => {
+                    if let Loc::Stack(idx) = loc {
+                        if idx >= self.fixed {
+                            if let Some(x) = self.live.get_mut(&loc) {
+                                *x = ip;
+                            }
+                        }
+                    }
+                }
+                Instruction::LoadArgs { locs, .. } => {
+                    for loc in locs {
+                        if let Loc::Stack(idx) = loc {
+                            if idx >= self.fixed {
+                                if let Some(x) = self.live.get_mut(&loc) {
+                                    *x = ip + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Instruction::Save { loc, .. } | Instruction::SaveComplex { loc, .. } => {
+                    if let Loc::Stack(idx) = loc {
+                        if idx >= self.fixed {
+                            self.live.insert(loc, ip);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn save(&mut self, loc: Loc) -> Loc {
+        if let Loc::Stack(idx) = loc {
+            if idx < self.fixed {
+                loc
+            } else if let Some(Loc::Stack(s)) = self.stack.get(&loc) {
+                // A stack slot can be assigned more than once in loops (ϕ-constructs)
+                Loc::Stack(*s)
+            } else {
+                let l = match self.pool.pop() {
+                    Some(l) => l, // pool is not empty
+                    None => {
+                        let l = Loc::Stack(self.count_stack);
+                        self.count_stack += if self.config.is_complex() { 2 } else { 1 };
+                        l
+                    }
+                };
+                self.stack.insert(loc, l);
+                l
+            }
+        } else {
+            loc
+        }
+    }
+
+    fn load(&mut self, loc: Loc, ip: usize) -> Loc {
+        if let Loc::Stack(idx) = loc {
+            if idx < self.fixed {
+                loc
+            } else {
+                let l = self
+                    .stack
+                    .get(&loc)
+                    .unwrap_or_else(|| panic!("cannot find {:?}", loc));
+                let last = self.live.get(&loc).unwrap();
+
+                // stack slots are not returned to the pool inside loops.
+                // We can do better by delaying return to the branch at
+                // the end of the loop, but this would add complexity.
+                if *last == ip && self.depth == 0 {
+                    self.pool.push(*l);
+                }
+                *l
+            }
+        } else {
+            loc
+        }
+    }
+
+    fn compact_stack(&mut self, mir: &Mir) {
+        for (ip, ins) in mir.code.iter().enumerate() {
+            match &ins {
+                Instruction::Load { dst, loc } => {
+                    let l = self.load(*loc, ip);
+                    self.push(Instruction::Load { dst: *dst, loc: l });
+                }
+                Instruction::LoadComplex { xd, yd, loc } => {
+                    let l = self.load(*loc, ip);
+                    self.push(Instruction::LoadComplex {
+                        xd: *xd,
+                        yd: *yd,
+                        loc: l,
+                    });
+                }
+                Instruction::LoadArgs {
+                    locs,
+                    complex,
+                    ultra,
+                } => {
+                    let l: Vec<Loc> = locs.iter().map(|x| self.load(*x, ip)).collect();
+                    self.push(Instruction::LoadArgs {
+                        locs: l,
+                        complex: *complex,
+                        ultra: *ultra,
+                    })
+                }
+                Instruction::LoadMath { op, dst, s1, loc } => {
+                    let l = self.load(*loc, ip);
+                    self.push(Instruction::LoadMath {
+                        op: *op,
+                        dst: *dst,
+                        s1: *s1,
+                        loc: l,
+                    })
+                }
+                Instruction::IfElse {
+                    dst,
+                    true_val,
+                    false_val,
+                    cond,
+                } => {
+                    let l = self.load(*cond, ip);
+                    self.push(Instruction::IfElse {
+                        dst: *dst,
+                        true_val: *true_val,
+                        false_val: *false_val,
+                        cond: l,
+                    });
+                }
+                Instruction::Save { src, loc } => {
+                    let l = self.save(*loc);
+                    self.push(Instruction::Save { src: *src, loc: l });
+                }
+                Instruction::SaveComplex { xs, ys, loc } => {
+                    let l = self.save(*loc);
+                    self.push(Instruction::SaveComplex {
+                        xs: *xs,
+                        ys: *ys,
+                        loc: l,
+                    });
+                }
+                Instruction::SaveArgs {
+                    num_args,
+                    complex,
+                    ultra,
+                } => self.push(Instruction::SaveArgs {
+                    num_args: *num_args,
+                    complex: *complex,
+                    ultra: *ultra,
+                }),
+                Instruction::Label { label } => {
+                    if !self.labels.contains(label) {
+                        // beginning of a backward loop
+                        self.labels.insert(label.into());
+                        self.depth += 1;
+                    };
+
+                    self.push(Instruction::Label {
+                        label: label.clone(),
+                    });
+                }
+                Instruction::Branch { label } => {
+                    if !self.labels.contains(label) {
+                        // forward jump
+                        self.labels.insert(label.into());
+                    } else {
+                        // end of backward loop
+                        self.depth -= 1;
+                    };
+
+                    self.push(Instruction::Branch {
+                        label: label.clone(),
+                    });
+                }
+                Instruction::BranchIf {
+                    cond,
+                    label,
+                    is_else,
+                } => {
+                    if !self.labels.contains(label) {
+                        self.labels.insert(label.into());
+                    } else {
+                        self.depth -= 1;
+                    };
+
+                    self.push(Instruction::BranchIf {
+                        cond: *cond,
+                        label: label.clone(),
+                        is_else: *is_else,
+                    });
+                }
+                _ => {
+                    self.push(ins.clone());
+                }
+            }
+        }
+    }
+}
